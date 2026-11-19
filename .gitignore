@@ -1,0 +1,22 @@
+
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Node dependencies
+node_modules/
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated files
+dist/
+build/
+*.log
+
+# Machine learning model artifact
+*.joblib
