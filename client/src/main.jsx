@@ -1,3 +1,4 @@
+import Chatbot from './components/Chatbot';
 import React,{useEffect,useMemo,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{io}from'socket.io-client';
@@ -5,7 +6,30 @@ import{Activity,ArrowRight,BarChart3,CalendarClock,CheckCircle2,ClipboardList,Cl
 import './style.css';
 const API=import.meta.env.VITE_API_URL||'http://localhost:5000';
 const saved=()=>{try{return JSON.parse(localStorage.getItem('waitless_session'))}catch{return null}};
-async function request(path,{token,method='GET',body}={}){const response=await fetch(`${API}/api${path}`,{method,headers:{'content-type':'application/json',...(token?{authorization:`Bearer ${token}`}:{})},body:body?JSON.stringify(body):undefined});let json={};try{json=await response.json()}catch{}if(!response.ok)throw Error(json.error||`Request failed (${response.status})`);return json;}
+async function request(path,{token,method='GET',body}={}){
+  const response=await fetch(`${API}/api${path}`,{
+    method,
+    headers:{'content-type':'application/json',...(token?{authorization:`Bearer ${token}`}:{})},
+    body:body?JSON.stringify(body):undefined
+  });
+  let json={};
+  try{json=await response.json()}catch{}
+  if(!response.ok){
+    const message=json.error||`Request failed (${response.status})`;
+    // 403 can also mean a normal cross-department denial: do NOT log out for that.
+    const disabledAccount=response.status===403 && /account disabled|account.*unavailable/i.test(message);
+    const invalidLogin=response.status===401;
+    if(token && (disabledAccount||invalidLogin)){
+      window.dispatchEvent(new CustomEvent('waitless:session-invalid',{
+        detail:{token,reason:disabledAccount?'Your account has been disabled. Please contact the administrator.':'Your session has expired. Please sign in again.'}
+      }));
+    }
+    const error=new Error(message);
+    error.status=response.status;
+    throw error;
+  }
+  return json;
+}
 const portalRoles=['student','staff','admin'];
 const portalPath=role=>`/${role}/login`;
 const dashboardPath=role=>`/${role}/dashboard`;
@@ -23,10 +47,42 @@ function App(){
  const [staffService,setStaffService]=useState('');
  const [staffCounter,setStaffCounter]=useState('');
  useEffect(()=>{const handler=()=>setRoute(currentRoute());window.addEventListener('popstate',handler);return()=>window.removeEventListener('popstate',handler)},[]);
+ // Clear cached personal/queue information when the server revokes this session.
+ useEffect(()=>{
+   const onInvalidSession=(event)=>{
+     const stored=saved();
+     if(!stored?.token || stored.token!==event.detail?.token)return;
+     const previousRole=stored.user?.role||'student';
+     localStorage.removeItem('waitless_session');
+     setSession(null);
+     setServices([]);setCounters([]);setTokens([]);setStats({});setStaffList([]);
+     setCounterId('');setServiceId('');setTab('dashboard');setAuthMode('login');
+     goTo(portalPath(previousRole));
+     setNotice(event.detail.reason||'Session ended. Please sign in again.');
+   };
+   window.addEventListener('waitless:session-invalid',onInvalidSession);
+   return()=>window.removeEventListener('waitless:session-invalid',onInvalidSession);
+ },[]);
  const [authMode,setAuthMode]=useState('login');const [notice,setNotice]=useState('');const [loading,setLoading]=useState(false);const [services,setServices]=useState([]);const [counters,setCounters]=useState([]);const [tokens,setTokens]=useState([]);const [stats,setStats]=useState({});const [serviceId,setServiceId]=useState('');const [counterId,setCounterId]=useState('');const [tab,setTab]=useState('dashboard');const [serviceName,setServiceName]=useState('');const [duration,setDuration]=useState('10');const [counterLabel,setCounterLabel]=useState('');const [counterService,setCounterService]=useState('');
  const token=session?.token,role=session?.user?.role;
  const flash=(message)=>setNotice(message);
- async function refresh(){if(!token)return;try{const [s,c,q]=await Promise.all([request('/services',{token}),request('/counters',{token}),request('/queue',{token})]);setServices(s);setCounters(c);setTokens(q);if(role!=='student')setStats(await request('/stats',{token}));if(role==='admin')setStaffList(await request('/admin/staff',{token}));}catch(e){flash(e.message)}}
+ async function refresh(){
+   if(!token)return;
+   const stillCurrent=()=>saved()?.token===token;
+   try{
+     const [s,c,q]=await Promise.all([
+       request('/services',{token}),request('/counters',{token}),request('/queue',{token})
+     ]);
+     if(!stillCurrent())return;
+     const extra=role==='student'?null:await request('/stats',{token});
+     if(!stillCurrent())return;
+     const staff=role==='admin'?await request('/admin/staff',{token}):null;
+     if(!stillCurrent())return;
+     setServices(s);setCounters(c);setTokens(q);
+     if(extra!==null)setStats(extra);
+     if(staff!==null)setStaffList(staff);
+   }catch(e){if(stillCurrent())flash(e.message)}
+ }
  useEffect(()=>{if(!token)return;refresh();const socket=io(API,{auth:{token}});socket.on('queue:changed',refresh);const interval=setInterval(refresh,20000);return()=>{socket.disconnect();clearInterval(interval)}},[token,role]);
  async function doAuth(e){
   e.preventDefault();setLoading(true);flash('');
@@ -43,7 +99,7 @@ function App(){
   }catch(e){flash(e.message)}finally{setLoading(false)}
  }
  async function action(path,method='POST',body){setLoading(true);flash('');try{const response=await request(path,{token,method,body});flash(response.token_code?`Token ${response.token_code} generated successfully.`:'Action completed.');await refresh()}catch(e){flash(e.message)}finally{setLoading(false)}}
- function logout(){const previousRole=role||'student';localStorage.removeItem('waitless_session');setSession(null);setTokens([]);setTab('dashboard');setAuthMode('login');flash('');goTo(portalPath(previousRole));}
+ function logout(){const previousRole=role||'student';localStorage.removeItem('waitless_session');setSession(null);setServices([]);setCounters([]);setTokens([]);setStats({});setStaffList([]);setCounterId('');setServiceId('');setTab('dashboard');setAuthMode('login');flash('');goTo(portalPath(previousRole));}
  const active=tokens.filter(t=>['waiting','called','serving'].includes(t.status));const myActive=active.find(t=>t.status!=='completed');const currentCounter=counters.find(c=>String(c.id)===String(counterId));const currentToken=tokens.find(t=>t.counter_id===currentCounter?.id&&['called','serving'].includes(t.status));
  const waitingByService=useMemo(()=>Object.fromEntries(services.map(s=>[s.id,tokens.filter(t=>t.service_id===s.id&&t.status==='waiting').length])),[services,tokens]);
  if(route==='/' || !/^\/(student|staff|admin)\/(login|dashboard)$/.test(route))return <div className="auth-layout"><div className="auth-hero"><div className="mark"><Users size={34}/><span>Wait<span className="green">Less</span></span></div><div className="hero-content"><span className="pill"><Wifi size={14}/> UNIVERSITY QUEUE PLATFORM</span><h1>Less waiting.<br/><em>More living.</em></h1><p>Choose your dedicated portal to continue.</p><div className="hero-cards"><span><Ticket/> Virtual tokens</span><span><ShieldCheck/> Secure access</span><span><BarChart3/> Predictions</span></div></div><p className="tiny">Academic prototype • Estimates require real-world validation</p></div><div className="auth-side"><div className="auth-card"><div className="brand-small"><GraduationCap/> WaitLess Portal</div><h2>Choose your portal</h2><p className="muted">Each role has a dedicated sign-in page.</p>{portalRoles.map(r=><button key={r} type="button" className="btn primary wide" style={{marginTop:14,textTransform:'capitalize'}} onClick={()=>{setAuthMode('login');flash('');goTo(portalPath(r))}}>{r} Login <ArrowRight size={16}/></button>)}</div></div></div>;
@@ -58,7 +114,17 @@ function App(){
  {tab==='queue'&&<section className="card"><div className="table-title"><h2><ClipboardList size={20}/> {role==='student'?'My Token History':'Active & Recent Tokens'}</h2><span className="muted">Live data from MySQL</span></div><div className="table-scroll"><table><thead><tr><th>Token</th><th>Student</th><th>Service</th><th>Status</th><th>Estimate</th><th>Issued</th></tr></thead><tbody>{tokens.map(t=><tr key={t.id}><td><strong>{t.token_code}</strong></td><td>{t.student_name}</td><td>{t.service_name}</td><td><span className={`status ${t.status}`}>{t.status}</span></td><td>{t.predicted_minutes??'—'} min</td><td>{fmtDate(t.issued_at)}</td></tr>)}</tbody></table>{tokens.length===0&&<div className="empty">No tokens to display.</div>}</div></section>}
  {tab==='manage'&&role==='admin'&&<div className="columns"><form className="card" onSubmit={e=>{e.preventDefault();action('/admin/services','POST',{name:serviceName,avg_duration_min:Number(duration)}).then(()=>{setServiceName('')})}}><h2><Plus size={20}/> Add a Service</h2><label>Service name<input value={serviceName} onChange={e=>setServiceName(e.target.value)} required placeholder="e.g. Student Affairs"/></label><label>Average service duration (minutes)<input type="number" min="1" max="240" value={duration} onChange={e=>setDuration(e.target.value)}/></label><Button disabled={loading} className="btn primary wide">Create Service</Button></form><form className="card" onSubmit={e=>{e.preventDefault();action('/admin/counters','POST',{label:counterLabel,service_id:Number(counterService)}).then(()=>setCounterLabel(''))}}><h2><Plus size={20}/> Add a Counter</h2><label>Counter name<input value={counterLabel} onChange={e=>setCounterLabel(e.target.value)} required placeholder="e.g. Registrar Desk 2"/></label><label>Service<select required value={counterService} onChange={e=>setCounterService(e.target.value)}><option value="">Choose</option>{services.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label><Button disabled={loading} className="btn primary wide">Create Counter</Button></form></div>}
  {tab==='staff'&&role==='admin'&&<><div className="columns"><form className="card" onSubmit={async e=>{e.preventDefault();setLoading(true);flash('');try{await request('/admin/staff',{token,method:'POST',body:{name:staffName,email:staffEmail,password:staffPassword,service_id:Number(staffService),counter_id:Number(staffCounter)}});setStaffName('');setStaffEmail('');setStaffPassword('');flash('Staff account created and assigned.');await refresh()}catch(err){flash(err.message)}finally{setLoading(false)}}}><h2><Users size={20}/> Create Staff Account</h2><label>Full name<input required minLength="2" value={staffName} onChange={e=>setStaffName(e.target.value)}/></label><label>Email<input required type="email" value={staffEmail} onChange={e=>setStaffEmail(e.target.value)}/></label><label>Initial password (12+ characters)<input required type="password" minLength="12" autoComplete="new-password" value={staffPassword} onChange={e=>setStaffPassword(e.target.value)}/></label><label>Department<select required value={staffService} onChange={e=>{setStaffService(e.target.value);setStaffCounter('')}}><option value="">Choose department</option>{services.filter(s=>s.is_active).map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label><label>Counter<select required value={staffCounter} onChange={e=>setStaffCounter(e.target.value)}><option value="">Choose counter</option>{counters.filter(c=>c.is_active&&String(c.service_id)===String(staffService)).map(c=><option key={c.id} value={c.id}>{c.label}</option>)}</select></label><Button disabled={loading} className="btn primary wide">Create Staff & Assign</Button></form><section className="card"><h2><ShieldCheck size={20}/> Department security</h2><p className="muted">Staff can access only the assigned department and counter. Authorization is verified by the backend.</p><p className="helper">Use strong temporary passwords and have staff change them through a future password-change flow. Never share passwords or commit credentials.</p></section></div><section className="card" style={{marginTop:20}}><h2><ClipboardList size={20}/> Staff Accounts</h2><div className="table-scroll"><table><thead><tr><th>Staff</th><th>Email</th><th>Department</th><th>Counter</th><th>Account</th><th>Action</th></tr></thead><tbody>{staffList.map(u=><tr key={u.id}><td>{u.name}</td><td>{u.email}</td><td>{u.service_name||'Unassigned'}</td><td>{u.counter_label||'—'}</td><td>{u.is_active?'Active':'Disabled'}</td><td><Button disabled={loading} className="btn outline" onClick={async()=>{setLoading(true);try{await request(`/admin/staff/${u.id}/status`,{token,method:'PATCH',body:{is_active:!Boolean(u.is_active)}});flash('Staff account status updated');await refresh()}catch(err){flash(err.message)}finally{setLoading(false)}}}>{u.is_active?'Disable':'Enable'}</Button></td></tr>)}</tbody></table></div></section></>}
- <footer className="main-footer">WaitLess • University Capstone Prototype • Predictions need validation on real operating data.</footer></main></div>
+ <Chatbot
+  session={session}
+  services={services}
+  counters={counters}
+  tokens={tokens}
+  stats={stats}
+/>
+
+<footer className="main-footer">
+  WaitLess • University Capstone Prototype
+</footer></main></div>
 }
 function Kpi({icon,label,value}){return <div className="kpi"><div className="kpi-icon">{icon}</div><small>{label}</small><strong>{value}</strong></div>}
 createRoot(document.getElementById('root')).render(<App/>);
